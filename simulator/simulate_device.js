@@ -1,7 +1,8 @@
 const mqtt = require('mqtt');
 
 const BROKER = process.env.MQTT_BROKER || 'mqtt://localhost:1883';
-const TOPIC = 'wearable/device1/vitals';
+const DEVICE_ID = process.argv[2] || 'device1';
+const TOPIC = `wearable/${DEVICE_ID}/vitals`;
 
 const client = mqtt.connect(BROKER);
 
@@ -39,6 +40,7 @@ function publishReading() {
 
   const motion = generateMotion();
   const reading = {
+    device_id: DEVICE_ID,
     heart_rate,
     temperature,
     motion,

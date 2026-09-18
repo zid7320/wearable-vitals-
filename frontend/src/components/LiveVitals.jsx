@@ -1,4 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { updateAnomalyWindow } from '../utils/anomaly'
+import { getZone } from '../utils/zones'
+import useToast from './useToast'
 
 const EMPTY_READING = {
   heart_rate: null,
@@ -7,12 +10,122 @@ const EMPTY_READING = {
   timestamp: null,
 }
 
-const isAbnormalHeartRate = (value) => value == null || value < 50 || value > 120
-const isAbnormalTemperature = (value) => value == null || value > 38
+const ANIMATION_DURATION = 400
 
-function LiveVitals({ onReading }) {
+const EMPTY_DISPLAYED_READING = {
+  heart_rate: null,
+  temperature: null,
+  motion: null,
+}
+
+const EMPTY_ANOMALIES = {
+  heart_rate: false,
+  temperature: false,
+}
+
+function LiveVitals({ onReading, thresholds, selectedDevice, onDeviceSeen }) {
   const [latest, setLatest] = useState(EMPTY_READING)
+  const [displayed, setDisplayed] = useState(EMPTY_DISPLAYED_READING)
+  const [anomalies, setAnomalies] = useState(EMPTY_ANOMALIES)
   const [connectionStatus, setConnectionStatus] = useState('connecting')
+  const { addToast } = useToast()
+  const previousZones = useRef({
+    heart_rate: 'normal',
+    temperature: 'normal',
+  })
+  const selectedDeviceRef = useRef(selectedDevice)
+  const animationFrames = useRef({
+    heart_rate: null,
+    temperature: null,
+    motion: null,
+  })
+  const displayedValues = useRef(EMPTY_DISPLAYED_READING)
+  const trendWindows = useRef(new Map())
+
+  useEffect(() => {
+    selectedDeviceRef.current = selectedDevice
+  }, [selectedDevice])
+
+  useEffect(() => {
+    displayedValues.current = EMPTY_DISPLAYED_READING
+    previousZones.current = { heart_rate: 'normal', temperature: 'normal' }
+  }, [selectedDevice])
+
+  const animateValue = (field, target) => {
+    if (!Number.isFinite(target)) return
+
+    const previousFrame = animationFrames.current[field]
+    if (previousFrame !== null) {
+      cancelAnimationFrame(previousFrame)
+    }
+
+    const start = displayedValues.current[field]
+    if (!Number.isFinite(start)) {
+      displayedValues.current[field] = target
+      setDisplayed((current) => ({ ...current, [field]: target }))
+      return
+    }
+
+    const startedAt = performance.now()
+    const frame = (now) => {
+      const progress = Math.min((now - startedAt) / ANIMATION_DURATION, 1)
+      const easedProgress = 1 - (1 - progress) ** 3
+      const value = start + (target - start) * easedProgress
+
+      displayedValues.current[field] = value
+      setDisplayed((current) => ({ ...current, [field]: value }))
+
+      if (progress < 1) {
+        animationFrames.current[field] = requestAnimationFrame(frame)
+      } else {
+        animationFrames.current[field] = null
+      }
+    }
+
+    animationFrames.current[field] = requestAnimationFrame(frame)
+  }
+
+  const checkZoneTransition = useCallback((vitalType, value) => {
+    const nextZone = getZone(vitalType, value, thresholds)
+    const previousZone = previousZones.current[vitalType]
+
+    if (previousZone !== nextZone && nextZone !== 'normal') {
+      const vitalLabel = vitalType === 'heart_rate' ? 'Heart rate' : 'Temperature'
+      const formattedValue = vitalType === 'heart_rate'
+        ? `${Math.round(Number(value))} BPM`
+        : `${Number(value).toFixed(1)}°C`
+      const zoneLabel = nextZone === 'warning' ? 'elevated' : 'critical'
+
+      addToast({
+        zone: nextZone,
+        message: `${vitalLabel} ${zoneLabel}: ${formattedValue}`,
+      })
+
+      if (
+        nextZone === 'critical'
+        && typeof Notification !== 'undefined'
+        && Notification.permission === 'granted'
+        && document.hidden
+      ) {
+        new Notification(`${vitalLabel} critical`, { body: `${vitalLabel} critical: ${formattedValue}` })
+      }
+    }
+
+    previousZones.current[vitalType] = nextZone
+  }, [addToast, thresholds])
+
+  const checkTrendAnomaly = useCallback((deviceId, vitalType, value) => {
+    if (!deviceId) return
+
+    const key = `${deviceId}:${vitalType}`
+    const currentWindow = trendWindows.current.get(key) || []
+    const result = updateAnomalyWindow(currentWindow, value)
+    trendWindows.current.set(key, result.readings)
+
+    if (!selectedDeviceRef.current || selectedDeviceRef.current === deviceId) {
+      setAnomalies((current) => ({ ...current, [vitalType]: result.anomalous }))
+    }
+  }, [])
 
   useEffect(() => {
     let socket
@@ -33,7 +146,22 @@ function LiveVitals({ onReading }) {
         try {
           const payload = JSON.parse(event.data)
           if (payload && payload.data) {
+            const incomingDevice = payload.data.device_id
+            if (typeof onDeviceSeen === 'function' && incomingDevice) {
+              onDeviceSeen(incomingDevice)
+            }
+
+            checkTrendAnomaly(incomingDevice, 'heart_rate', payload.data.heart_rate)
+            checkTrendAnomaly(incomingDevice, 'temperature', payload.data.temperature)
+
+            if (selectedDeviceRef.current && incomingDevice !== selectedDeviceRef.current) return
+
             setLatest(payload.data)
+            checkZoneTransition('heart_rate', payload.data.heart_rate)
+            checkZoneTransition('temperature', payload.data.temperature)
+            animateValue('heart_rate', Number(payload.data.heart_rate))
+            animateValue('temperature', Number(payload.data.temperature))
+            animateValue('motion', Number(payload.data.motion))
             if (typeof onReading === 'function') {
               onReading(payload.data)
             }
@@ -63,12 +191,35 @@ function LiveVitals({ onReading }) {
       if (reconnectTimer) clearTimeout(reconnectTimer)
       if (socket) socket.close()
     }
-  }, [onReading])
+  }, [checkTrendAnomaly, checkZoneTransition, onDeviceSeen, onReading])
 
-  const motionValue = Number(latest.motion ?? 0)
+  useEffect(() => {
+    const frames = animationFrames.current
+
+    return () => {
+      Object.values(frames).forEach((frame) => {
+        if (frame !== null) cancelAnimationFrame(frame)
+      })
+    }
+  }, [])
+
+  const hasSelectedReading = !selectedDevice || latest.device_id === selectedDevice
+  const visibleReading = hasSelectedReading ? latest : EMPTY_READING
+  const visibleDisplayed = hasSelectedReading ? displayed : EMPTY_DISPLAYED_READING
+  const visibleAnomalies = hasSelectedReading ? anomalies : EMPTY_ANOMALIES
+  const motionValue = Number(visibleDisplayed.motion ?? 0)
   const motionLabel = motionValue > 0.5 ? 'Active' : 'Resting'
-  const heartIsAbnormal = isAbnormalHeartRate(latest.heart_rate)
-  const temperatureIsAbnormal = isAbnormalTemperature(latest.temperature)
+  const heartZone = getZone('heart_rate', visibleReading.heart_rate, thresholds)
+  const temperatureZone = getZone('temperature', visibleReading.temperature, thresholds)
+  const heartRate = Number(visibleReading.heart_rate)
+  const heartPulseDuration = Number.isFinite(heartRate) && heartRate > 0 ? 60 / heartRate : 1
+  const displayedTimestamp = visibleReading.timestamp
+
+  const zoneBadgeText = {
+    normal: 'NORMAL',
+    warning: 'ELEVATED',
+    critical: 'ABNORMAL',
+  }
 
   const formatTime = (timestamp) => {
     if (!timestamp) return 'Waiting for data...'
@@ -97,37 +248,50 @@ function LiveVitals({ onReading }) {
           <span className={`connection-badge connection-badge--${connectionStatus}`}>
             {statusText}
           </span>
-          <span className="timestamp">{formatTime(latest.timestamp)}</span>
+          <span className="timestamp">{formatTime(displayedTimestamp)}</span>
         </div>
       </div>
 
       <div className="stats-grid">
-        <article className={`stat-card stat-card--heart ${heartIsAbnormal ? 'stat-card--alert' : ''}`}>
-          <label>Heart Rate</label>
+        <article className={`stat-card stat-card--heart stat-card--${heartZone === 'critical' ? 'alert' : heartZone}`}>
+          <label className="heart-rate-label">
+            <span>Heart Rate</span>
+            <span
+              className="heart-pulse"
+              style={{ animationDuration: `${heartPulseDuration}s` }}
+              aria-hidden="true"
+            />
+          </label>
           <div className="value-row">
-            <span className={`value ${heartIsAbnormal ? 'value--alert' : ''}`}>
-              {latest.heart_rate ?? '--'}
+            <span className={`value ${heartZone === 'critical' ? 'value--alert' : heartZone === 'warning' ? 'value--warning' : ''}`}>
+              {visibleDisplayed.heart_rate == null ? '--' : Math.round(visibleDisplayed.heart_rate)}
             </span>
             <span className="unit">BPM</span>
           </div>
-          {heartIsAbnormal && <div className="alert-text">Abnormal</div>}
+          <div className={`zone-badge zone-badge--${heartZone}`}>
+            {zoneBadgeText[heartZone]}
+          </div>
+          {visibleAnomalies.heart_rate && <div className="trend-anomaly-badge">Unusual reading</div>}
         </article>
 
-        <article className={`stat-card stat-card--temp ${temperatureIsAbnormal ? 'stat-card--alert' : ''}`}>
+        <article className={`stat-card stat-card--temp stat-card--${temperatureZone === 'critical' ? 'alert' : temperatureZone}`}>
           <label>Temperature</label>
           <div className="value-row">
-            <span className={`value ${temperatureIsAbnormal ? 'value--alert' : ''}`}>
-              {latest.temperature != null ? latest.temperature.toFixed(1) : '--'}
+            <span className={`value ${temperatureZone === 'critical' ? 'value--alert' : temperatureZone === 'warning' ? 'value--warning' : ''}`}>
+              {visibleDisplayed.temperature == null ? '--' : visibleDisplayed.temperature.toFixed(1)}
             </span>
             <span className="unit">°C</span>
           </div>
-          {temperatureIsAbnormal && <div className="alert-text">High temp</div>}
+          <div className={`zone-badge zone-badge--${temperatureZone}`}>
+            {zoneBadgeText[temperatureZone]}
+          </div>
+          {visibleAnomalies.temperature && <div className="trend-anomaly-badge">Unusual reading</div>}
         </article>
 
         <article className="stat-card stat-card--motion">
           <label>Motion</label>
           <div className="value-row">
-            <span className="value">{motionValue > 0 ? motionValue.toFixed(1) : '0.0'}</span>
+            <span className="value">{visibleDisplayed.motion == null ? '--' : visibleDisplayed.motion.toFixed(1)}</span>
             <span className="unit">{motionLabel}</span>
           </div>
         </article>
